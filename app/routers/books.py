@@ -1,64 +1,119 @@
-from typing import Annotated
-from fastapi import APIRouter, HTTPException, Path, Query, status
-from app.data import BOOKS
-from app.models import BookCreate, BookOut, BookUpdate
+from fastapi import APIRouter, Depends, HTTPException, status, Query
+from sqlalchemy.orm import Session
+from typing import List, Optional
+from app.database import get_db
+from app.models import BookModel
+from pydantic import BaseModel, Field
 
-router = APIRouter(prefix="/books", tags=["Books"])
-BookId = Annotated[int, Path(gt=0, description="Mã sách")]
+router = APIRouter(
+    prefix="/books",
+    tags=["Books"]
+)
 
-def find_book(book_id: int) -> dict:
-    for b in BOOKS:
-        if b["id"] == book_id:
-            return b
-    raise HTTPException(status.HTTP_404_NOT_FOUND,
-                        f"Không tìm thấy sách id={book_id}")
+class BookCreate(BaseModel):
+    title: str = Field(..., min_length=1)
+    author: str = Field(..., min_length=1)
+    year: int = Field(..., ge=1000, le=2030)
+    isbn: str = Field(..., min_length=10)
+    category: str = Field(..., min_length=1)
+    quantity: int = Field(1, ge=0)
 
-def check_isbn(isbn: str, exclude_id: int | None = None) -> None:
-    if any(b["isbn"] == isbn and b["id"] != exclude_id for b in BOOKS):
-        raise HTTPException(status.HTTP_409_CONFLICT,
-                            f"ISBN {isbn} đã tồn tại")
+class BookUpdate(BaseModel):
+    title: Optional[str] = None
+    author: Optional[str] = None
+    year: Optional[int] = None
+    isbn: Optional[str] = None
+    category: Optional[str] = None
+    quantity: Optional[int] = None
 
-@router.get("", response_model=list[BookOut], summary="Danh sách sách")
-def list_books(
-    q: Annotated[str | None, Query(max_length=50)] = None,
-    author: str | None = None,
-    skip: Annotated[int, Query(ge=0)] = 0,
-    limit: Annotated[int, Query(ge=1, le=100)] = 10,
+class BookResponse(BookCreate):
+    id: int
+
+    class Config:
+        from_attributes = True
+
+@router.get("", response_model=List[BookResponse])
+def get_books(
+    q: Optional[str] = None,
+    author: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=100),
+    db: Session = Depends(get_db)
 ):
-    data = BOOKS
+    query = db.query(BookModel)
     if q:
-        data = [b for b in data if q.lower() in b["title"].lower()]
+        query = query.filter(BookModel.title.contains(q) | BookModel.category.contains(q))
     if author:
-        data = [b for b in data if author.lower() in b["author"].lower()]
-    return data[skip : skip + limit]
+        query = query.filter(BookModel.author.contains(author))
+    return query.offset(skip).limit(limit).all()
 
-@router.get("/{book_id}", response_model=BookOut, summary="Chi tiết sách")
-def get_book(book_id: BookId):
-    return find_book(book_id)
+@router.get("/{book_id}", response_model=BookResponse)
+def get_book(book_id: int, db: Session = Depends(get_db)):
+    book = db.query(BookModel).filter(BookModel.id == book_id).first()
+    if not book:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail={"error": "Not Found", "message": "Không tìm thấy sách"}
+        )
+    return book
 
-@router.post("", response_model=BookOut,
-             status_code=status.HTTP_201_CREATED, summary="Thêm sách")
-def create_book(book: BookCreate):
-    check_isbn(book.isbn)
-    new_id = max((b["id"] for b in BOOKS), default=0) + 1
-    new = {"id": new_id, **book.model_dump()}
-    BOOKS.append(new)
-    return new
+@router.post("", response_model=BookResponse, status_code=status.HTTP_201_CREATED)
+def create_book(book: BookCreate, db: Session = Depends(get_db)):
+    existing_book = db.query(BookModel).filter(BookModel.isbn == book.isbn).first()
+    if existing_book:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, 
+            detail={"error": "Conflict", "message": "ISBN đã tồn tại trong hệ thống"}
+        )
+    
+    db_book = BookModel(**book.dict())
+    db.add(db_book)
+    db.commit()
+    db.refresh(db_book)
+    return db_book
 
-@router.put("/{book_id}", response_model=BookOut, summary="Cập nhật toàn bộ")
-def replace_book(book_id: BookId, book: BookCreate):
-    current = find_book(book_id)
-    check_isbn(book.isbn, exclude_id=book_id)
-    current.update(book.model_dump())
-    return current
+# --- NGHIỆP VỤ MƯỢN / TRẢ SÁCH (BÀI MỞ RỘNG) ---
+@router.post("/{book_id}/borrow", response_model=BookResponse)
+def borrow_book(book_id: int, db: Session = Depends(get_db)):
+    book = db.query(BookModel).filter(BookModel.id == book_id).first()
+    if not book:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail={"error": "Not Found", "message": "Không tìm thấy sách"}
+        )
+    if book.quantity <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, 
+            detail={"error": "Conflict", "message": "Sách đã hết"}
+        )
+    
+    book.quantity -= 1
+    db.commit()
+    db.refresh(book)
+    return book
 
-@router.patch("/{book_id}", response_model=BookOut, summary="Cập nhật một phần")
-def update_book(book_id: BookId, book: BookUpdate):
-    current = find_book(book_id)
-    current.update(book.model_dump(exclude_unset=True))
-    return current
+@router.post("/{book_id}/return", response_model=BookResponse)
+def return_book(book_id: int, db: Session = Depends(get_db)):
+    book = db.query(BookModel).filter(BookModel.id == book_id).first()
+    if not book:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail={"error": "Not Found", "message": "Không tìm thấy sách"}
+        )
+    
+    book.quantity += 1
+    db.commit()
+    db.refresh(book)
+    return book
 
-@router.delete("/{book_id}", status_code=status.HTTP_204_NO_CONTENT,
-               summary="Xóa sách")
-def delete_book(book_id: BookId):
-    BOOKS.remove(find_book(book_id))
+@router.delete("/{book_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_book(book_id: int, db: Session = Depends(get_db)):
+    db_book = db.query(BookModel).filter(BookModel.id == book_id).first()
+    if not db_book:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail={"error": "Not Found", "message": "Không tìm thấy sách"}
+        )
+    db.delete(db_book)
+    db.commit()
+    return None

@@ -1,20 +1,13 @@
-from pydantic import BaseModel, Field
+from sqlalchemy import Column, Integer, String
+from app.database import Base
 
-class BookBase(BaseModel):
-    isbn: str = Field(pattern=r"^\d{13}$", examples=["9786040000011"])
-    title: str = Field(min_length=1, max_length=200)
-    author: str = Field(min_length=1, max_length=100)
-    year: int = Field(ge=1900, le=2100)
-    quantity: int = Field(default=1, ge=0)
+class BookModel(Base):
+    __tablename__ = "books"
 
-class BookCreate(BookBase):
-    pass
-
-class BookUpdate(BaseModel):
-    title: str | None = Field(default=None, min_length=1, max_length=200)
-    author: str | None = Field(default=None, min_length=1, max_length=100)
-    year: int | None = Field(default=None, ge=1900, le=2100)
-    quantity: int | None = Field(default=None, ge=0)
-
-class BookOut(BookBase):
-    id: int
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    title = Column(String, index=True, nullable=False)
+    author = Column(String, index=True, nullable=False)
+    year = Column(Integer, nullable=False)
+    isbn = Column(String, unique=True, index=True, nullable=False)
+    category = Column(String, index=True, nullable=False)
+    quantity = Column(Integer, default=1, nullable=False)
